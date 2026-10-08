@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Room Remembers</title>
+<style>
+html,body{margin:0;height:100%;background:#0b0a10;color:#d9cfc0;font-family:"Palatino Linotype",Palatino,Georgia,serif}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+canvas{width:min(96vw,960px);height:auto;aspect-ratio:640/416;background:#000;border:1px solid #2a2635}
+p{margin:0;font-size:14px;opacity:.7;max-width:640px;text-align:center}
+</style></head><body>
+<canvas id="c" width="640" height="416"></canvas>
+<p>Move with WASD or arrows. Hold Shift or Space to sneak (slower, but the ghost only notices you from 2 tiles away). E picks up or drops a key. R restarts.</p>
+<script>
+const cv=document.getElementById('c'),g=cv.getContext('2d');
+const T=32,W=20,H=13,LOOP=60;
+// ---- map ----
+const map=[];for(let y=0;y<H;y++)map.push(Array(W).fill('#'));
+function room(a,b,c,d){for(let y=b;y<=d;y++)for(let x=a;x<=c;x++)map[y][x]='.'}
+room(1,1,5,7);room(7,1,12,7);room(14,1,18,7);room(14,9,18,11);
+map[4][6]='.';map[4][13]='D';map[8][16]='E';map[11][16]='X';
+[[9,3],[9,5],[16,3],[16,5],[3,2],[4,6]].forEach(([x,y])=>map[y][x]='#');
+const ctr=n=>(n+.5)*T;
+// ---- state ----
+let st='title',loop=1,t=LOOP,total=0,open,items,p,ghost,glances=0,glT=0,wasSeen=false,msg='',msgT=0,carry=null,
+heat=new Float32Array(W*H),teleT=8,flick=0,heatT=0,gs=0,sneakNow=false,prevPath=[],curPath=[],best=null,resetMsg='',resetT=0,k={},lightR=135,ac=null,memCount=0;
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const say=s=>{msg=s;msgT=3};
+function ad(a,b){let d=a-b;while(d>Math.PI)d-=2*Math.PI;while(d<-Math.PI)d+=2*Math.PI;return Math.abs(d)}
+// ---- storage (ghost remembers between sessions) ----
+function load(){try{const h=JSON.parse(localStorage.getItem('ghostHeat')||'null');if(h)h.forEach((v,i)=>{heat[i]=v*.6});best=JSON.parse(localStorage.getItem('best')||'null')}catch(e){}}
+function save(){try{localStorage.setItem('ghostHeat',JSON.stringify(Array.from(heat).map(v=>Math.round(v))));localStorage.setItem('best',JSON.stringify(best))}catch(e){}}
+function mem(){let n=0;for(const v of heat)if(v>=2)n++;return n}
+// ---- audio ----
+function thud(f,v,d=.14){if(!ac)return;const o=ac.createOscillator(),n=ac.createGain();o.type='sine';o.frequency.value=f;n.gain.setValueAtTime(v,ac.currentTime);n.gain.exponentialRampToValueAtTime(.001,ac.currentTime+d);o.connect(n);n.connect(ac.destination);o.start();o.stop(ac.currentTime+d)}
+// ---- world helpers ----
+function solid(tx,ty){if(tx<0||ty<0||tx>=W||ty>=H)return true;const c=map[ty][tx];return c==='#'||(c==='D'&&!open.D)||(c==='E'&&!open.E)}
+function blocked(x,y){const r=9;for(const[dx,dy]of[[-r,-r],[r,-r],[-r,r],[r,r]]){const tx=(x+dx)/T|0,ty=(y+dy)/T|0,c=map[ty]&&map[ty][tx];
+ if(c==='D'&&!open.D&&carry==='k1'){open.D=true;say('The lock gives way.')}
+ if(c==='E'&&!open.E&&carry==='k2'){open.E=true;say('The last door opens.')}
+ if(solid(tx,ty))return true}return false}
+function los(ax,ay,bx,by){const d=Math.hypot(bx-ax,by-ay),n=Math.ceil(d/6);for(let i=1;i<n;i++){const x=ax+(bx-ax)*i/n,y=ay+(by-ay)*i/n;if(map[y/T|0][x/T|0]==='#')return false}return true}
+function bfs(sx,sy,gx,gy){if(sx===gx&&sy===gy)return null;const prev=new Int16Array(W*H).fill(-1),q=[sy*W+sx];prev[sy*W+sx]=sy*W+sx;
+ while(q.length){const c=q.shift(),cx=c%W,cy=c/W|0;if(cx===gx&&cy===gy)break;
+  for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){const nx=cx+dx,ny=cy+dy;if(nx<0||ny<0||nx>=W||ny>=H||ny>7||map[ny][nx]==='#')continue;const ni=ny*W+nx;if(prev[ni]<0){prev[ni]=c;q.push(ni)}}}
+ let c=gy*W+gx;if(prev[c]<0)return null;while(prev[c]!==sy*W+sx)c=prev[c];return[c%W,c/W|0]}
+// ---- ghost brain: walks to places the player visits most ----
+function guardTile(){return !open.D?[12,4]:!open.E?[16,7]:null}
+function pickGoal(){const gt=guardTile();if(gt&&Math.random()<(carry?.8:.4))return gt;let tot=0;const w=[];for(let i=0;i<W*H;i++){const v=(map[i/W|0][i%W]==='#'||i/W>=8)?0:Math.pow(heat[i],1.5);w.push(v);tot+=v}
+ if(tot<3){let x,y;do{x=rnd(1,W)|0;y=rnd(1,8)|0}while(map[y][x]==='#');return[x,y]}
+ let r=Math.random()*tot;for(let i=0;i<w.length;i++){r-=w[i];if(r<=0)return[i%W,i/W|0]}return[1,1]}
+function teleport(){for(let i=0;i<30;i++){let x,y,idx=-1;if(prevPath.length>4){idx=rnd(0,prevPath.length)|0;[x,y]=prevPath[idx]}else[x,y]=pickGoal();const px=ctr(x),py=ctr(y);
+  if(Math.hypot(px-p.x,py-p.y)>6*T&&Math.hypot(px-ctr(3),py-ctr(4))>5*T&&!los(p.x,p.y,px,py)){ghost.x=px;ghost.y=py;ghost.route=idx>=0?prevPath:null;ghost.ri=idx+1;ghost.goal=pickGoal();ghost.mode='hunt';ghost.guard='';ghost.wait=.8;thud(55,.12,.5);return}}}
+function gStep(dt,sp){const gx=ghost.x/T|0,gy=ghost.y/T|0,ch=ghost.mode==='chase',r=ghost.route;
+ const goal=ch?[p.x/T|0,p.y/T|0]:(r&&ghost.ri<r.length?r[ghost.ri]:ghost.goal);
+ const n=bfs(gx,gy,goal[0],goal[1]);let cx,cy;
+ if(n){cx=ctr(n[0]);cy=ctr(n[1])}else if(ch&&gx===goal[0]&&gy===goal[1]){cx=p.x;cy=p.y}
+ else{if(r&&ghost.ri<r.length)ghost.ri++;else{ghost.goal=pickGoal();ghost.wait=1.4}return}
+ const d=Math.hypot(cx-ghost.x,cy-ghost.y),s=sp*T*dt;ghost.moving=true;
+ if(d<=s){ghost.x=cx;ghost.y=cy}else{ghost.x+=(cx-ghost.x)/d*s;ghost.y+=(cy-ghost.y)/d*s}}
+// ---- flow ----
+function newGame(){open={D:false,E:false};heat.fill(0);prevPath=[];curPath=[];load();loop=1;total=0;items={k1:{x:ctr(11),y:ctr(2)},k2:{x:ctr(18),y:ctr(6)}};carry=null;startLoop()}
+function startLoop(){if(curPath.length>5)prevPath=curPath;curPath=[];p={x:ctr(3),y:ctr(4),face:0,stepT:0,tile:-1};ghost={x:ctr(17),y:ctr(6),mode:'hunt',goal:[11,4],wait:5,moving:false,chaseT:0,route:null,ri:0};
+ t=LOOP;glances=0;wasSeen=false;teleT=14;st='play';say(loop===1?'Find a key. Leave it where you can reach it next time.':'Loop '+loop+'. Keys and opened doors stayed as you left them.')}
+function reset(m){if(st!=='play')return;if(carry){items[carry].x=p.x;items[carry].y=p.y;carry=null}thud(40,.2,.8);resetMsg=m;resetT=1.8;st='reset';loop++}
+function win(){const rec={loops:loop,time:Math.round(total)};if(!best||rec.loops<best.loops||(rec.loops===best.loops&&rec.time<best.time))best=rec;save();st='win'}
+// ---- input ----
+addEventListener('keydown',e=>{const key=e.key.toLowerCase();if(!ac){try{ac=new(window.AudioContext||window.webkitAudioContext)()}catch(x){}}
+ if(['arrowup','arrowdown','arrowleft','arrowright',' '].includes(key))e.preventDefault();
+ k[key]=true;k.shift=e.shiftKey;
+ if(st==='title'){newGame();return}
+ if(key==='r'){st==='win'?(newGame()):newGame();return}
+ if(key==='e'&&!e.repeat&&st==='play'){
+  if(carry){items[carry].x=p.x;items[carry].y=p.y;say('Dropped. It will be here next loop.');carry=null}
+  else for(const id in items){if(Math.hypot(items[id].x-p.x,items[id].y-p.y)<30){carry=id;say('Picked up the '+(id==='k1'?'amber':'ice')+' key.');break}}}});
+addEventListener('keyup',e=>{k[e.key.toLowerCase()]=false;k.shift=e.shiftKey});
+addEventListener('blur',()=>{for(const x in k)k[x]=false});
+// ---- update ----
+function update(dt){
+ if(st==='reset'){resetT-=dt;if(resetT<=0)startLoop();return}
+ if(st!=='play')return;
+ t-=dt;total+=dt;msgT-=dt;if(t<=0)return reset('You ran out of time. The loop resets.');
+ let ax=(k.d||k.arrowright?1:0)-(k.a||k.arrowleft?1:0),ay=(k.s||k.arrowdown?1:0)-(k.w||k.arrowup?1:0),sneak=k.shift||k[' '];sneakNow=!!sneak;
+ if(ax||ay){const l=Math.hypot(ax,ay),s=(sneak?1.5:3)*T*dt;p.face=Math.atan2(ay,ax);
+  if(!blocked(p.x+ax/l*s,p.y))p.x+=ax/l*s;if(!blocked(p.x,p.y+ay/l*s))p.y+=ay/l*s;
+  p.stepT-=dt;if(p.stepT<=0){thud(95,sneak?.02:.06,.1);p.stepT=sneak?.7:.38}}
+ const ct=(p.y/T|0)*W+(p.x/T|0);if(ct!==p.tile){p.tile=ct;heat[ct]+=1;curPath.push([ct%W,ct/W|0])}
+ if(map[p.y/T|0][p.x/T|0]==='X')return win();
+ // ghost
+ const gd=Math.hypot(ghost.x-p.x,ghost.y-p.y),vis=los(p.x,p.y,ghost.x,ghost.y);
+ teleT-=dt;if(teleT<=0){teleport();teleT=Math.max(6,rnd(10,14)-loop*.5)}
+ flick=(gd<8*T||teleT<1)?1:0;
+ const range=sneak?2*T:5*T;
+ if(vis&&gd<range){ghost.mode='chase';ghost.chaseT=3}else if(ghost.mode==='chase'){ghost.chaseT-=dt*(sneak?3:1);if(ghost.chaseT<=0){ghost.mode='hunt';ghost.goal=pickGoal()}}
+ const need=(carry==='k1'&&!open.D)?[12,4]:(carry==='k2'&&!open.E)?[16,7]:null;
+ if(need&&ghost.mode!=='chase'&&ghost.guard!==need.join()){ghost.route=null;ghost.goal=need;ghost.guard=need.join()}
+ ghost.moving=false;if(ghost.mode==='chase')ghost.wait=0;if(ghost.wait>0)ghost.wait-=dt;else gStep(dt,ghost.mode==='chase'?2+.1*Math.min(loop,6):2);
+ if(ghost.moving)gs-=dt;
+ if(ghost.moving&&gd<9*T&&gs<=0){const v=.16*(1-gd/(9*T)),behind=ghost.mode==='chase'&&ad(Math.atan2(ghost.y-p.y,ghost.x-p.x),p.face)>2;thud(70,v);if(behind)setTimeout(()=>thud(70,v),110);gs=.55}
+ if(gd<.55*T)return reset('The ghost caught you. The loop resets.');
+ lightR=flick?rnd(95,140):135;
+}
+// ---- draw ----
+function keyShape(x,y,col){g.fillStyle=col;g.beginPath();g.arc(x,y-4,5,0,7);g.fill();g.fillRect(x-1.5,y-1,3,10);g.fillRect(x,y+5,5,2)}
+function draw(){
+ g.fillStyle='#0b0a10';g.fillRect(0,0,640,416);
+ if(st==='title'){g.textAlign='center';g.fillStyle='#e8dcc8';g.font='34px Georgia';g.fillText('The Room Remembers',320,120);g.font='17px Georgia';
+  ['Time folds back every 60 seconds. You return to the start.','Doors you open stay open. Keys stay where you leave them.','The ghost remembers every place you walk, and goes looking there.','Shift or Space sneaks: slower, but it only notices you from close.',mem()?'It still remembers '+mem()+' places from last time.':'',best?'Best escape: '+best.loops+' loops, '+best.time+'s':'','Press any key to begin'].forEach((s,i)=>g.fillText(s,320,175+i*28));return}
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++){const c=map[y][x],px=x*T,py=y*T;
+  if(c==='#'){g.fillStyle='#34303f';g.fillRect(px,py,T,T);g.fillStyle='#454052';g.fillRect(px,py,T,3)}
+  else{g.fillStyle=(x+y)%2?'#1d1a26':'#201d2a';g.fillRect(px,py,T,T);
+   if(c==='D'||c==='E'){const o=c==='D'?open.D:open.E,col=c==='D'?'#c98a2b':'#7fb4c9';g.fillStyle=o?'#201d2a':'#4a2a22';g.fillRect(px,py,T,T);g.strokeStyle=col;g.lineWidth=2;g.strokeRect(px+3,py+3,T-6,T-6);if(!o){g.fillStyle=col;g.fillRect(px+13,py+13,6,8)}}
+   if(c==='X'){g.fillStyle='#b9ecd3';g.fillRect(px+6,py+6,T-12,T-12)}}}
+ for(const id in items){if(carry===id)continue;keyShape(items[id].x,items[id].y,id==='k1'?'#ffb454':'#a8d8ea')}
+ // ghost
+ const gd=Math.hypot(ghost.x-p.x,ghost.y-p.y);
+ if(los(p.x,p.y,ghost.x,ghost.y)&&gd<lightR+20){const a=Math.min(1,1.2-gd/(lightR+20));g.fillStyle='rgba(190,235,228,'+a+')';
+  g.beginPath();g.arc(ghost.x,ghost.y-4,11,Math.PI,0);g.lineTo(ghost.x+11,ghost.y+11);for(let i=0;i<4;i++)g.lineTo(ghost.x+11-(i+.5)*5.5,ghost.y+(i%2?11:6));g.lineTo(ghost.x-11,ghost.y+11);g.fill();
+  g.fillStyle='#0b0a10';g.fillRect(ghost.x-6,ghost.y-6,4,5);g.fillRect(ghost.x+2,ghost.y-6,4,5)}
+ // player + view cone
+ g.fillStyle='#ffd9a0';g.beginPath();g.arc(p.x,p.y,sneakNow?6:8,0,7);g.fill();
+ if(carry)keyShape(p.x,p.y-18,carry==='k1'?'#ffb454':'#a8d8ea');
+ // darkness
+ const gr=g.createRadialGradient(p.x,p.y,10,p.x,p.y,lightR);gr.addColorStop(0,'rgba(8,7,12,0)');gr.addColorStop(.55,'rgba(8,7,12,.55)');gr.addColorStop(1,'rgba(8,7,12,.985)');
+ g.fillStyle=gr;g.fillRect(0,0,640,416);
+ // hud
+ g.fillStyle='#2a2635';g.fillRect(0,0,640,6);g.fillStyle=t<15?'#c0503a':'#ffb454';g.fillRect(0,0,640*Math.max(0,t)/LOOP,6);
+ g.textAlign='left';g.font='14px Georgia';g.fillStyle='#e8dcc8';g.fillText('Loop '+loop+', '+Math.ceil(Math.max(0,t))+'s left',10,24);g.fillText('Ghost knows '+mem()+' places',10,42);
+ if(sneakNow){g.textAlign='right';g.fillText('Sneaking',630,24)}
+ g.textAlign='center';if(msgT>0&&st==='play'){g.fillStyle='#e8dcc8';g.fillText(msg,320,404)}
+ if(st==='reset'){g.fillStyle='rgba(0,0,0,'+Math.min(1,(1.8-resetT)*2)+')';g.fillRect(0,0,640,416);g.fillStyle='#e8dcc8';g.font='22px Georgia';g.fillText(resetMsg,320,215)}
+ if(st==='win'){g.fillStyle='rgba(0,0,0,.88)';g.fillRect(0,0,640,416);g.fillStyle='#e8dcc8';g.font='30px Georgia';g.fillText('You got out.',320,150);g.font='17px Georgia';
+  g.fillText('It took '+loop+' loop'+(loop>1?'s':'')+' and '+Math.round(total)+' seconds.',320,200);g.fillText('Best: '+best.loops+' loops, '+best.time+'s',320,230);
+  g.fillText('It remembers the way you walked. Press R to go back in.',320,280)}
+}
+let last=performance.now();
+(function frame(n){const dt=Math.min(.05,(n-last)/1000);last=n;update(dt);draw();requestAnimationFrame(frame)})(last);
+load();
+</script></body></html>
